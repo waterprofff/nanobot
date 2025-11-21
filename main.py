@@ -30,9 +30,7 @@ IMAGE_MODEL_ID = "google/gemini-3-pro-image-preview-free"
 
 _genai_client: genai.Client | None = None
 
-# Чат владельца бота (опционально).
-# Возьмём из переменной окружения OWNER_CHAT_ID.
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # можно строкой, Telegram это переварит
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # опционально
 
 
 def get_genai_client() -> genai.Client:
@@ -50,7 +48,7 @@ def get_genai_client() -> genai.Client:
             "(сюда нужно положить ваш sk-ai-v1-ключ от Zenmux)"
         )
 
-    logger.info("Инициализирую GenAI клиент с кастомным base_url %s", ZENUMX_BASE_URL)
+    logger.info("Инициализирую GenAI клиент с кастомным base_url %s", ZENMUX_BASE_URL)
 
     _genai_client = genai.Client(
         api_key=api_key,
@@ -76,7 +74,7 @@ def generate_image(prompt: str) -> BytesIO:
             model=IMAGE_MODEL_ID,
             contents=[prompt],
             config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],  # просим именно картинку
+                response_modalities=["IMAGE"],
             ),
         )
     except Exception as e:
@@ -85,13 +83,11 @@ def generate_image(prompt: str) -> BytesIO:
 
     image_bytes_io: BytesIO | None = None
 
-    # Ищем часть ответа с картинкой
     for part in response.parts:
         if part.inline_data is not None:
-            img = part.as_image()  # объект с методом save(...)
+            img = part.as_image()
             buf = BytesIO()
-            # Важно: без format="PNG", Zenmux-обёртка ожидает только один аргумент
-            img.save(buf)
+            img.save(buf)  # важно — без format=
             buf.seek(0)
             image_bytes_io = buf
             break
@@ -127,10 +123,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Любой обычный текст считаем промптом для генерации картинки.
-    Никаких /imagine не нужно.
-    """
     if not update.message or not update.message.text:
         return
 
@@ -143,10 +135,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    """
-    Общая логика: показать заглушку → вызвать API → отправить картинку пользователю
-    → опционально отправить копию владельцу бота (без данных о пользователе).
-    """
     chat_id = update.effective_chat.id
 
     wait_message = await context.bot.send_message(
@@ -165,7 +153,7 @@ async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await wait_message.edit_text(f"Не удалось сгенерировать картинку 😔\nОшибка: {e}")
         return
 
-    # 1) Отправляем картинку пользователю
+    # отправка пользователю
     try:
         image_io.name = "generated.png"
         await context.bot.send_photo(
@@ -179,30 +167,27 @@ async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         except Exception:
             pass
     except Exception as e:
-        logger.exception("Ошибка отправки изображения пользователю в Telegram")
+        logger.exception("Ошибка отправки изображения пользователю")
         await wait_message.edit_text(
             f"Картинка сгенерирована, но не удалось отправить её в чат.\nОшибка: {e}"
         )
         return
 
-    # 2) Опционально отправляем копию владельцу бота
-    # Без указания каких-либо контактных данных пользователя.
+    # отправка владельцу
     if OWNER_CHAT_ID:
         try:
-            # Создаём новый буфер, чтобы не зависеть от уже использованного image_io
-            owner_buf = BytesIO(image_io.getvalue())
-            owner_buf.name = "generated.png"
-            owner_buf.seek(0)
+            buf2 = BytesIO(image_io.getvalue())
+            buf2.name = "generated.png"
+            buf2.seek(0)
 
-            # Только промпт, никаких user_id, username и т.п.
             await context.bot.send_photo(
                 chat_id=OWNER_CHAT_ID,
-                photo=owner_buf,
+                photo=buf2,
                 caption=f"Новая сгенерированная картинка.\nПромпт:\n`{prompt}`",
                 parse_mode="Markdown",
             )
         except Exception as e:
-            logger.exception("Не удалось отправить картинку владельцу бота: %s", e)
+            logger.exception("Ошибка отправки владельцу: %s", e)
 
 
 # ----------------- ЗАПУСК ЧЕРЕЗ WEBHOOK (Render) -----------------
@@ -228,10 +213,8 @@ def main():
 
     application = Application.builder().token(telegram_token).build()
 
-    # Хендлеры
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    # Любой текст без команд — сразу генерация
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     application.post_init = on_startup
@@ -239,7 +222,11 @@ def main():
     webhook_path = f"/webhook/{telegram_token}"
     webhook_url = base_webhook_url.rstrip("/") + webhook_path
 
-    logger.info("Запуск webhook-сервера на порту %s, webhook_url=%s", port, webhook_url)
+    logger.info(
+        "Запуск webhook-сервера на порту %s, webhook_url=%s",
+        port,
+        webhook_url,
+    )
 
     application.run_webhook(
         listen="0.0.0.0",
