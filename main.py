@@ -2,7 +2,6 @@ import logging
 import os
 from io import BytesIO
 
-import requests  # kept only if you want to debug raw HTTP; not used in main flow
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -24,16 +23,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ----------------- НАСТРОЙКА КЛИЕНТА ZENMUX + GEMINI -----------------
+# ----------------- НАСТРОЙКА ZENMUX + GEMINI -----------------
 
-ZENUMX_BASE_URL = "https://zenmux.ai/api/vertex-ai"
+ZENMUX_BASE_URL = "https://zenmux.ai/api/vertex-ai"
 IMAGE_MODEL_ID = "google/gemini-3-pro-image-preview-free"
 
-_genai_client = None
+_genai_client: genai.Client | None = None
 
 
 def get_genai_client() -> genai.Client:
-    """Ленивая инициализация клиента Google Gen AI через Zenmux."""
+    """
+    Ленивая инициализация клиента Google GenAI через Zenmux.
+    """
     global _genai_client
     if _genai_client is not None:
         return _genai_client
@@ -41,18 +42,18 @@ def get_genai_client() -> genai.Client:
     api_key = os.getenv("ZENMUX_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "Не задана переменная окружения ZENUMX_API_KEY "
+            "Не задана переменная окружения ZENMUX_API_KEY "
             "(сюда нужно положить ваш sk-ai-v1-ключ от Zenmux)"
         )
 
-    logger.info("Инициализирую GenAI клиент с кастомным base_url %s", ZENUMX_BASE_URL)
+    logger.info("Инициализирую GenAI клиент с кастомным base_url %s", ZENMUX_BASE_URL)
 
     _genai_client = genai.Client(
         api_key=api_key,
         vertexai=True,
         http_options=types.HttpOptions(
             api_version="v1",
-            base_url=ZENUMX_BASE_URL,
+            base_url=ZENMUX_BASE_URL,
         ),
     )
     return _genai_client
@@ -62,7 +63,7 @@ def generate_image(prompt: str) -> BytesIO:
     """
     Генерация картинки через Zenmux / Google Gemini 3 Pro Image Preview.
 
-    Возвращает BytesIO с PNG-изображением, готовым к отправке в Telegram.
+    Возвращает BytesIO с изображением, готовым к отправке в Telegram.
     """
     client = get_genai_client()
 
@@ -71,7 +72,7 @@ def generate_image(prompt: str) -> BytesIO:
             model=IMAGE_MODEL_ID,
             contents=[prompt],
             config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
+                response_modalities=["IMAGE"],  # просим именно картинку
             ),
         )
     except Exception as e:
@@ -83,9 +84,10 @@ def generate_image(prompt: str) -> BytesIO:
     # Ищем часть ответа с картинкой
     for part in response.parts:
         if part.inline_data is not None:
-            img = part.as_image()  # Pillow Image
+            img = part.as_image()    # объект с методом save(...)
             buf = BytesIO()
-            img.save(buf, format="PNG")
+            # ВАЖНО: без format="PNG", только один аргумент
+            img.save(buf)
             buf.seek(0)
             image_bytes_io = buf
             break
@@ -97,35 +99,34 @@ def generate_image(prompt: str) -> BytesIO:
     return image_bytes_io
 
 
-# ----------------- ОБРАБОТЧИКИ ТЕЛЕГРАМ-БОТА -----------------
+# ----------------- ОБРАБОТЧИКИ ТЕЛЕГРАМ -----------------
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Привет! Я бот, который генерирует картинки через Zenmux + Gemini 3 Pro 🖼\n\n"
-        "Просто отправь мне текстовый запрос, например:\n"
-        "  «кот-астронавт в неоновом городе, фотореализм»\n\n"
-        "Или используй команду:\n"
-        "  /imagine кот-астронавт в неоновом городе\n"
+        "Просто отправь текст с описанием изображения — и я попробую его нарисовать.\n\n"
+        "Например:\n"
+        "  кот-астронавт в неоновом городе, фотореализм\n"
     )
     await update.message.reply_text(text)
 
 
-async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = " ".join(context.args).strip()
-    if not prompt:
-        await update.message.reply_text(
-            "Напиши после /imagine, что нужно нарисовать 🙂\n\n"
-            "Пример:\n"
-            "  /imagine кот-астронавт, синее небо, фотореализм"
-        )
-        return
-
-    await handle_generation(update, context, prompt)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Просто напиши текстовый запрос, и я сгенерирую картинку.\n\n"
+        "Примеры:\n"
+        "  кот-бариста в стиле неонового киберпанка\n"
+        "  домик в лесу на рассвете, реалистичный стиль\n"
+    )
+    await update.message.reply_text(text)
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Любой обычный текст считаем промптом для генерации изображения."""
+    """
+    Любой обычный текст считаем промптом для генерации картинки.
+    Никаких /imagine не нужно.
+    """
     if not update.message or not update.message.text:
         return
 
@@ -138,7 +139,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    """Общий код: показать заглушку → дернуть API → отправить картинку."""
+    """
+    Общая логика: показать заглушку → вызвать API → отправить картинку.
+    """
     chat_id = update.effective_chat.id
 
     wait_message = await context.bot.send_message(
@@ -176,7 +179,7 @@ async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
 
 
-# ----------------- ЗАПУСК ЧЕРЕЗ WEBHOOK (Render Web Service) -----------------
+# ----------------- ЗАПУСК ЧЕРЕЗ WEBHOOK (Render) -----------------
 
 
 async def on_startup(app: Application):
@@ -201,7 +204,8 @@ def main():
 
     # Хендлеры
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("imagine", imagine_command))
+    application.add_handler(CommandHandler("help", help_command))
+    # Любой текст без команд — сразу генерация
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     application.post_init = on_startup
