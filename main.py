@@ -1,6 +1,7 @@
 import logging
 import os
 from io import BytesIO
+from uuid import uuid4
 
 from telegram import Update
 from telegram.ext import (
@@ -30,7 +31,8 @@ IMAGE_MODEL_ID = "google/gemini-3-pro-image-preview-free"
 
 _genai_client: genai.Client | None = None
 
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # опционально
+# Чат владельца бота (опционально, строкой)
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
 
 
 def get_genai_client() -> genai.Client:
@@ -85,9 +87,26 @@ def generate_image(prompt: str) -> BytesIO:
 
     for part in response.parts:
         if part.inline_data is not None:
+            # as_image возвращает объект, чей save ожидает ПУТЬ до файла, а не BytesIO
             img = part.as_image()
-            buf = BytesIO()
-            img.save(buf)  # важно — без format=
+
+            # сохраняем во временный файл
+            tmp_filename = f"/tmp/zenmux_{uuid4().hex}.png"
+            try:
+                img.save(tmp_filename)
+            except Exception as e:
+                logger.exception("Не удалось сохранить изображение во временный файл")
+                raise RuntimeError(f"Ошибка сохранения изображения: {e}")
+
+            # читаем файл в память
+            try:
+                with open(tmp_filename, "rb") as f:
+                    data = f.read()
+            except Exception as e:
+                logger.exception("Не удалось прочитать временный файл изображения")
+                raise RuntimeError(f"Ошибка чтения изображения: {e}")
+
+            buf = BytesIO(data)
             buf.seek(0)
             image_bytes_io = buf
             break
@@ -123,6 +142,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Любой обычный текст считаем промптом для генерации картинки.
+    """
     if not update.message or not update.message.text:
         return
 
@@ -135,6 +157,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    """
+    Логика: показать заглушку → вызвать API → отправить картинку пользователю
+    → опционально отправить копию владельцу (без данных пользователя).
+    """
     chat_id = update.effective_chat.id
 
     wait_message = await context.bot.send_message(
@@ -153,7 +179,7 @@ async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await wait_message.edit_text(f"Не удалось сгенерировать картинку 😔\nОшибка: {e}")
         return
 
-    # отправка пользователю
+    # 1) Отправка пользователю
     try:
         image_io.name = "generated.png"
         await context.bot.send_photo(
@@ -173,16 +199,16 @@ async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
         return
 
-    # отправка владельцу
+    # 2) Копия владельцу, без какой-либо информации о пользователе
     if OWNER_CHAT_ID:
         try:
-            buf2 = BytesIO(image_io.getvalue())
-            buf2.name = "generated.png"
-            buf2.seek(0)
+            owner_buf = BytesIO(image_io.getvalue())
+            owner_buf.seek(0)
+            owner_buf.name = "generated.png"
 
             await context.bot.send_photo(
                 chat_id=OWNER_CHAT_ID,
-                photo=buf2,
+                photo=owner_buf,
                 caption=f"Новая сгенерированная картинка.\nПромпт:\n`{prompt}`",
                 parse_mode="Markdown",
             )
