@@ -1,7 +1,8 @@
-import os
 import logging
-import requests
+import os
+from io import BytesIO
 
+import requests  # kept only if you want to debug raw HTTP; not used in main flow
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -11,7 +12,11 @@ from telegram.ext import (
     filters,
 )
 
-# Логирование (полезно смотреть в логах Render)
+from google import genai
+from google.genai import types
+
+# ----------------- ЛОГИРОВАНИЕ -----------------
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -19,102 +24,112 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ====== НАСТРОЙКА ВНЕШНЕГО API ГЕНЕРАЦИИ КАРТИНОК ======
+# ----------------- НАСТРОЙКА КЛИЕНТА ZENMUX + GEMINI -----------------
 
-IMAGE_API_URL = os.getenv("IMAGE_API_URL")  # обязательная переменная окружения
-IMAGE_API_KEY = os.getenv("IMAGE_API_KEY")  # если у вас нет ключа — оставьте пустым
+ZENUMX_BASE_URL = "https://zenmux.ai/api/vertex-ai"
+IMAGE_MODEL_ID = "google/gemini-3-pro-image-preview-free"
+
+_genai_client = None
 
 
-def generate_image(prompt: str) -> str:
-    """
-    Вызывает ваш API для генерации картинки.
+def get_genai_client() -> genai.Client:
+    """Ленивая инициализация клиента Google Gen AI через Zenmux."""
+    global _genai_client
+    if _genai_client is not None:
+        return _genai_client
 
-    Ожидается, что API вернет JSON вида:
-    {
-        "image_url": "https://...."
-    }
-
-    Вернем строку image_url, чтобы отправить ее в Telegram.
-    """
-
-    if not IMAGE_API_URL:
-        raise RuntimeError("Не задана переменная окружения IMAGE_API_URL")
-
-    headers = {
-        "Content-Type": "application/json",
-    }
-
-    # Если нужен ключ авторизации — добавляем.
-    if IMAGE_API_KEY:
-        # Поменяйте под свой API: иногда нужен "Authorization: Bearer <KEY>"
-        headers["Authorization"] = f"Bearer {IMAGE_API_KEY}"
-
-    payload = {
-        "prompt": prompt,
-        # сюда можно добавить другие параметры, если нужны:
-        # "steps": 30,
-        # "size": "1024x1024",
-    }
-
-    try:
-        resp = requests.post(
-            IMAGE_API_URL,
-            json=payload,
-            headers=headers,
-            timeout=120,  # вдруг генерация долгая
+    api_key = os.getenv("ZENMUX_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Не задана переменная окружения ZENUMX_API_KEY "
+            "(сюда нужно положить ваш sk-ai-v1-ключ от Zenmux)"
         )
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        logger.error("Ошибка запроса к API генерации: %s", e)
-        raise RuntimeError(f"Ошибка запроса к API: {e}")
+
+    logger.info("Инициализирую GenAI клиент с кастомным base_url %s", ZENUMX_BASE_URL)
+
+    _genai_client = genai.Client(
+        api_key=api_key,
+        vertexai=True,
+        http_options=types.HttpOptions(
+            api_version="v1",
+            base_url=ZENUMX_BASE_URL,
+        ),
+    )
+    return _genai_client
+
+
+def generate_image(prompt: str) -> BytesIO:
+    """
+    Генерация картинки через Zenmux / Google Gemini 3 Pro Image Preview.
+
+    Возвращает BytesIO с PNG-изображением, готовым к отправке в Telegram.
+    """
+    client = get_genai_client()
 
     try:
-        data = resp.json()
-    except ValueError as e:
-        logger.error("Не удалось разобрать JSON ответа: %s", e)
-        raise RuntimeError("API вернул не-JSON ответ")
+        response = client.models.generate_content(
+            model=IMAGE_MODEL_ID,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+            ),
+        )
+    except Exception as e:
+        logger.exception("Ошибка при вызове Zenmux / GenAI API")
+        raise RuntimeError(f"Ошибка при обращении к API генерации: {e}")
 
-    # Здесь подстроитесь под свой реальный ответ
-    image_url = data.get("image_url")
-    if not image_url:
-        logger.error("В ответе API нет поля image_url: %s", data)
-        raise RuntimeError("API не вернул поле image_url")
+    image_bytes_io: BytesIO | None = None
 
-    return image_url
+    # Ищем часть ответа с картинкой
+    for part in response.parts:
+        if part.inline_data is not None:
+            img = part.as_image()  # Pillow Image
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            image_bytes_io = buf
+            break
+
+    if image_bytes_io is None:
+        logger.error("API не вернул картинку. Полный ответ: %s", response)
+        raise RuntimeError("API не вернул изображение (inline_data отсутствует)")
+
+    return image_bytes_io
 
 
-# ====== ОБРАБОТЧИКИ ТЕЛЕГРАМ-БОТА ======
+# ----------------- ОБРАБОТЧИКИ ТЕЛЕГРАМ-БОТА -----------------
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start."""
     text = (
-        "Привет! Я бот для генерации картинок по текстовому запросу.\n\n"
-        "Отправь мне промпт (описание картинки) — и я попробую сгенерировать изображение.\n\n"
-        "Например:\n"
-        "  кот-астронавт на фоне туманности, реалистичный стиль\n\n"
+        "Привет! Я бот, который генерирует картинки через Zenmux + Gemini 3 Pro 🖼\n\n"
+        "Просто отправь мне текстовый запрос, например:\n"
+        "  «кот-астронавт в неоновом городе, фотореализм»\n\n"
         "Или используй команду:\n"
-        "  /imagine кот-астронавт на фоне туманности"
+        "  /imagine кот-астронавт в неоновом городе\n"
     )
     await update.message.reply_text(text)
 
 
 async def imagine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /imagine <prompt>."""
     prompt = " ".join(context.args).strip()
     if not prompt:
-        await update.message.reply_text("Напиши после /imagine, что нужно нарисовать 🙂")
+        await update.message.reply_text(
+            "Напиши после /imagine, что нужно нарисовать 🙂\n\n"
+            "Пример:\n"
+            "  /imagine кот-астронавт, синее небо, фотореализм"
+        )
         return
 
     await handle_generation(update, context, prompt)
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Любой обычный текст — воспринимаем как промпт."""
+    """Любой обычный текст считаем промптом для генерации изображения."""
     if not update.message or not update.message.text:
         return
 
     prompt = update.message.text.strip()
-    # Можно добавить фильтр: например, требовать хотя бы N символов
     if len(prompt) < 3:
         await update.message.reply_text("Слишком короткий запрос, попробуй описать подробнее 🙌")
         return
@@ -123,78 +138,79 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    """Общий код генерации картинки и отправки результата пользователю."""
+    """Общий код: показать заглушку → дернуть API → отправить картинку."""
     chat_id = update.effective_chat.id
 
-    # Сообщение-заглушка, чтобы пользователь видел, что что-то происходит
-    msg = await context.bot.send_message(
+    wait_message = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"Генерирую картинку по запросу:\n\n`{prompt}`\n\nЭто может занять немного времени…",
+        text=(
+            "Генерирую картинку через Zenmux + Gemini 3 Pro…\n\n"
+            f"Запрос:\n`{prompt}`"
+        ),
         parse_mode="Markdown",
     )
 
     try:
-        image_url = generate_image(prompt)
+        image_io = generate_image(prompt)
     except Exception as e:
-        logger.error("Ошибка генерации картинки: %s", e)
-        await msg.edit_text(f"Не удалось сгенерировать картинку 😔\nОшибка: {e}")
+        logger.error("Ошибка генерации: %s", e)
+        await wait_message.edit_text(f"Не удалось сгенерировать картинку 😔\nОшибка: {e}")
         return
 
-    # Пытаемся отправить картинку
     try:
+        image_io.name = "generated.png"
         await context.bot.send_photo(
             chat_id=chat_id,
-            photo=image_url,
+            photo=image_io,
             caption=f"Картинка по запросу:\n`{prompt}`",
             parse_mode="Markdown",
         )
-        # Удалим/обновим сообщение-заглушку
-        await msg.delete()
+        try:
+            await wait_message.delete()
+        except Exception:
+            pass
     except Exception as e:
-        logger.error("Ошибка отправки картинки в Telegram: %s", e)
-        await msg.edit_text(f"Картинка сгенерирована, но не удалось отправить её в чат.\nОшибка: {e}")
+        logger.exception("Ошибка отправки изображения в Telegram")
+        await wait_message.edit_text(
+            f"Картинка сгенерирована, но не удалось отправить её в чат.\nОшибка: {e}"
+        )
 
 
-# ====== ЗАПУСК БОТА ЧЕРЕЗ WEBHOOK (Render Web Service) ======
+# ----------------- ЗАПУСК ЧЕРЕЗ WEBHOOK (Render Web Service) -----------------
+
 
 async def on_startup(app: Application):
     logger.info("Бот запущен и готов принимать обновления.")
 
 
 def main():
-    token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
+    telegram_token = os.getenv("TELEGRAM_TOKEN")
+    if not telegram_token:
         raise RuntimeError("Не задана переменная окружения TELEGRAM_TOKEN")
 
-    # URL вашего сервиса на Render, например:
-    # https://my-image-bot.onrender.com
     base_webhook_url = os.getenv("WEBHOOK_URL")
     if not base_webhook_url:
-        raise RuntimeError("Не задана переменная окружения WEBHOOK_URL")
+        raise RuntimeError(
+            "Не задана переменная окружения WEBHOOK_URL.\n"
+            "Пример: https://my-zenmux-bot.onrender.com"
+        )
 
     port = int(os.getenv("PORT", "8443"))
 
-    # Создаем приложение Telegram
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(telegram_token).build()
 
     # Хендлеры
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("imagine", imagine_command))
-    # Все текстовые сообщения — как промпты
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # Хук на старт
     application.post_init = on_startup
 
-    # Секретный путь webhook (используем токен, чтобы никто посторонний не дергал)
-    webhook_path = f"/webhook/{token}"
-
-    # Полный URL вебхука
+    webhook_path = f"/webhook/{telegram_token}"
     webhook_url = base_webhook_url.rstrip("/") + webhook_path
 
-    logger.info("Запуск бота на порту %s, webhook_url=%s", port, webhook_url)
+    logger.info("Запуск webhook-сервера на порту %s, webhook_url=%s", port, webhook_url)
 
-    # Запускаем встроенный веб-сервер и регистрируем webhook в Telegram
     application.run_webhook(
         listen="0.0.0.0",
         port=port,
